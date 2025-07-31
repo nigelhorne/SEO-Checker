@@ -9,13 +9,16 @@ use JSON qw(decode_json);
 use Encode qw(decode);
 use HTTP::Request;
 use Try::Tiny;
+use IO::Async::Loop;
+use Net::Async::HTTP;
+use Future::Utils qw(fmap);
 
 # use LWP::Debug qw(+);
 
 sub new {
 	my ($class, %args) = @_;
+	$args{parallel} = 0;
 	my $self = bless {
-		# ua	=> LWP::Parallel::UserAgent->new,
 		# url	 => $args{url},
 		mobile => $args{mobile} // 0,
 		# keyword => $args{keyword},
@@ -26,12 +29,16 @@ sub new {
 	}, $class;
 
 	if($args{parallel}) {
-		$self->{ua} = LWP::UserAgent->new();
-	} else {
 		$self->{ua} = LWP::Parallel::UserAgent->new();
 		# $self->{ua}->nonblock(0);
+	} else {
+		$self->{ua} = LWP::UserAgent->new();
 	}
 
+	$self->{ua_string} = $self->{mobile}
+		? "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.198 Mobile Safari/537.36"
+		: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.198 Safari/537.36"
+	;
 	$self->{ua}->agent($self->{mobile}
 		? "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.198 Mobile Safari/537.36"
 		: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.198 Safari/537.36"
@@ -280,8 +287,8 @@ sub _check_urls_parallel {
 	next unless $url && !ref($url);  # skip if undefined or a reference
 		my $req = HTTP::Request->new('GET', $url);
 		if(my $res = $pua->register($req)) {
-		die $res->error_as_HTML;
-	}
+			die $res->error_as_HTML;
+		}
 
 		$reqmap{$url} = $req;
 	}
@@ -316,6 +323,55 @@ sub _check_urls_parallel {
 
 	return \%results;
 }
+
+sub _new_check_urls_parallel {
+    my ($self, $urls) = @_;
+
+    my $loop = IO::Async::Loop->new;
+
+    my $http = Net::Async::HTTP->new(
+        max_connections_per_host => 4,
+        user_agent => $self->{ua_string} || 'SEO::Checker',
+    );
+
+print join(';', @{$urls}), "\n";
+    $loop->add($http);
+
+    my $futures = fmap {
+        my $url = shift;
+
+        $http->GET($url)->then(sub {
+            my ($response) = @_;
+            my $code = $response->code;
+            my $message = $response->message;
+
+            Future->done({
+                url     => $url,
+                code    => $code,
+                success => ($code >= 200 && $code < 300) ? 1 : 0,
+                message => $message,
+            });
+        })->catch(sub {
+            my ($err) = @_;
+            Future->done({
+                url     => $url,
+                code    => 0,
+                success => 0,
+                message => $err || 'Request failed',
+            });
+        });
+
+    } foreach => $urls, concurrent => 10;
+
+ # Wrap the future in a timeout
+    Future::Utils::timeout($futures, 10, "Timed out");
+
+    print __LINE__, "\n";
+    my @results = $loop->await($futures);
+    print __LINE__, "\n";
+    return \@results;
+}
+
 
 sub _check_url {
 	my ($self, $url) = @_;
@@ -362,13 +418,8 @@ sub phase_4_checks {
 	my @img_urls = map { URI->new_abs($_->attr('src'), $base_uri)->as_string } grep { $_->attr('src') } @imgs;
 	my @link_urls = map { URI->new_abs($_->attr('href'), $base_uri)->as_string } grep { $_->attr('href') } @links;
 
-	if($self->{parellel}) {
+	if($self->{parallel}) {
 		print "🔍 Checking " . scalar(@img_urls) . " images and " . scalar(@link_urls) . " links in parallel...\n";
-		} else {
-		print "🔍 Checking " . scalar(@img_urls) . " images and " . scalar(@link_urls) . " links...\n";
-		}
-
-	if($self->{parellel}) {
 	my $img_results = $self->_check_urls_parallel(\@img_urls);
 	my $link_results = $self->_check_urls_parallel(\@link_urls);
 
@@ -406,6 +457,7 @@ if ($res) {
 	print "⚠️  $broken_links broken or redirected link(s) found\n" if $broken_links;
 	} else {
 		# !parallel
+		print "🔍 Checking " . scalar(@img_urls) . " images and " . scalar(@link_urls) . " links...\n";
 		foreach my $url(@img_urls) {
 			my $result = $self->_check_url($url);
 			if ($result->{success}) {
