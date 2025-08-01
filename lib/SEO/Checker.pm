@@ -31,6 +31,9 @@ sub new {
 	if($args{parallel}) {
 		$self->{ua} = LWP::Parallel::UserAgent->new();
 		# $self->{ua}->nonblock(0);
+		$self->{ua}->timeout(10);
+		$self->{ua}->redirect(1);
+		# $self->{ua}->ssl_opts(verify_hostname => 0);	# prevent "Can't connect to geocode.xyz:443 (certificate verify failed)"
 	} else {
 		$self->{ua} = LWP::UserAgent->new();
 	}
@@ -284,29 +287,25 @@ sub _check_urls_parallel {
 
 	my %reqmap;
 	for my $url (@urls) {
-	next unless $url && !ref($url);  # skip if undefined or a reference
+		next unless $url && !ref($url);  # skip if undefined or a reference
 		my $req = HTTP::Request->new('GET', $url);
 		if(my $res = $pua->register($req)) {
-			die $res->error_as_HTML;
+			die $res->error_as_HTML();
 		}
 
 		$reqmap{$url} = $req;
 	}
 
-	$pua->max_hosts(scalar(keys %reqmap) + 1);
+	$pua->max_hosts(scalar(@{$urls}) + 1);
 	my $entries = $pua->wait(20);
 
 	my %responses;
 	foreach (keys %$entries) {
-		my $response = $entries->{$_}->response;
-		$responses{$response->request->url} = $response;
-	}
+		my $res = $entries->{$_}->response;
 
-	 foreach (keys %responses) {
 		# response is of type HTTP::Response
-		my $res = $responses{$_};
 
-	my $url = $res->request->url();
+		my $url = $res->request->url();
 
 		if ($res->is_success) {
 			$results{$url} = { success => 1, code => $res->code, message => "OK" };
